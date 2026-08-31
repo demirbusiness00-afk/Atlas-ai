@@ -1,938 +1,806 @@
-# ATLAS AI V8
-# Self-checking research/paper signal engine.
-# S/R + MTF + liquidity + structure + VWAP + volume + RR + performance journal.
-# NO automatic order execution.
+"""
+ATLAS AI V9
+Paper-signal / research bot for Binance spot markets.
+
+Architecture:
+1D -> 4H -> 1H -> 15M
+2M is ONLY an entry/anti-miss trigger (built from Binance 1m candles).
+Core concepts:
+- market structure / BOS
+- support & resistance zones
+- liquidity sweep
+- retest
+- FVG
+- VWAP
+- volume profile approximation (POC / VAH / VAL)
+- ATR based stop/targets
+- minimum RR + minimum TP2 distance
+- paper trade tracking and performance
+- Telegram channel signals with TradingView buttons
+
+No order execution. No profit guarantee.
+"""
 
 import os
+import math
 import time
+import json
+import sqlite3
 import asyncio
 import logging
-import sqlite3
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
+from typing import Optional, List, Dict, Tuple
 
-import requests
+import aiohttp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+)
+
+# ---------------- CONFIG ----------------
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+SIGNAL_CHAT = os.getenv("SIGNAL_CHAT", os.getenv("SIGNAL_CHANNEL", "@ATLASRADAR")).strip()
+
+BINANCE_BASE = os.getenv("BINANCE_BASE", "https://api.binance.com").rstrip("/")
+SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "120"))
+UNIVERSE_SIZE = int(os.getenv("UNIVERSE_SIZE", "80"))
+
+# Keep signal quality high, but don't make V8's "everything must agree" mistake.
+READY_SCORE = int(os.getenv("READY_SCORE", "80"))
+WATCH_SCORE = int(os.getenv("WATCH_SCORE", "72"))
+MIN_RR = float(os.getenv("MIN_RR", "2.5"))
+MIN_TP2_PCT = float(os.getenv("MIN_TP2_PCT", "2.5"))
+MAX_STOP_PCT = float(os.getenv("MAX_STOP_PCT", "3.5"))
+
+# 1D/4H/1H/15M are the actual decision stack.
+TF_LIMITS = {"1d": 160, "4h": 220, "1h": 260, "15m": 260, "1m": 300}
+
+DB_PATH = os.getenv("DB_PATH", "atlas_v9.sqlite3")
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-log = logging.getLogger("atlas")
+log = logging.getLogger("ATLAS-V9")
 
-TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "").strip()
-SIGNAL_CHAT_ID = os.getenv("SIGNAL_CHAT_ID", "@ATLASRADAR").strip()
+# ---------------- DATA ----------------
 
-SCAN_INTERVAL = max(60, int(os.getenv("SCAN_INTERVAL", "120")))
-UNIVERSE_SIZE = max(20, min(100, int(os.getenv("UNIVERSE_SIZE", "80"))))
-THRESHOLD = max(70, min(100, int(os.getenv("RADAR_THRESHOLD", "82"))))
-COOLDOWN = max(900, int(os.getenv("SIGNAL_COOLDOWN", "3600")))
-WORKERS = max(4, min(12, int(os.getenv("MAX_WORKERS", "8"))))
+@dataclass
+class Candle:
+    ts: int
+    o: float
+    h: float
+    l: float
+    c: float
+    v: float
 
-# Long-horizon quality filters.
-MIN_RR = float(os.getenv("MIN_RR", "2.5"))
-MIN_TP2_PCT = float(os.getenv("MIN_TP2_PCT", "0.025"))  # 2.5%
-MAX_STOP_PCT = float(os.getenv("MAX_STOP_PCT", "0.035")) # 3.5%
-TRACK_HOURS = max(6, int(os.getenv("TRACK_HOURS", "48")))
+@dataclass
+class Analysis:
+    symbol: str
+    direction: str
+    score: int
+    status: str
+    reason: str
+    entry: float
+    stop: float
+    tp1: float
+    tp2: float
+    rr: float
+    support: float
+    resistance: float
+    vwap: float
+    poc: float
+    vah: float
+    val: float
+    atr: float
+    htf: str
+    structure_4h: str
+    setup_1h: str
+    trigger_15m: str
+    trigger_2m: str
+    tv_url: str
 
-BASE = "https://api.binance.com"
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "AtlasAI-V8"})
-
-DB_PATH = os.getenv("ATLAS_DB", "atlas_v8.db")
-
-state = {
-    "scans": 0, "last": 0.0, "universe": 0, "scanned": 0,
-    "ready": 0, "signals": 0, "errors": 0, "skipped": 0,
-    "last_error": "", "top": [], "running": False,
-    "blocked_quality": 0, "tracked": 0
-}
-sent = defaultdict(float)
-scan_lock = asyncio.Lock()
-scan_task = None
-tracker_task = None
-
+# ---------------- DB ----------------
 
 def db():
-    con = sqlite3.connect(DB_PATH)
-    con.execute("""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS signals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
             symbol TEXT NOT NULL,
-            side TEXT NOT NULL,
+            direction TEXT NOT NULL,
             score INTEGER NOT NULL,
             entry REAL NOT NULL,
             stop REAL NOT NULL,
             tp1 REAL NOT NULL,
             tp2 REAL NOT NULL,
-            support REAL,
-            resistance REAL,
-            reason TEXT,
-            status TEXT DEFAULT 'OPEN',
-            closed_ts INTEGER,
-            close_price REAL
+            status TEXT NOT NULL DEFAULT 'OPEN',
+            close_price REAL,
+            close_reason TEXT,
+            closed_at INTEGER
         )
     """)
-    con.commit()
-    return con
+    conn.commit()
+    return conn
 
+def save_signal(a: Analysis):
+    conn = db()
+    conn.execute("""
+        INSERT INTO signals
+        (created_at,symbol,direction,score,entry,stop,tp1,tp2,status)
+        VALUES (?,?,?,?,?,?,?,?,?)
+    """, (
+        int(time.time()), a.symbol, a.direction, a.score,
+        a.entry, a.stop, a.tp1, a.tp2, "OPEN"
+    ))
+    conn.commit()
+    conn.close()
 
-def allowed(update):
-    if not ALLOWED_CHAT_ID:
-        return True
-    chat = update.effective_chat
-    return bool(chat and str(chat.id) == ALLOWED_CHAT_ID)
+def performance():
+    conn = db()
+    rows = conn.execute("""
+        SELECT status, COUNT(*) FROM signals
+        GROUP BY status
+    """).fetchall()
+    open_count = conn.execute(
+        "SELECT COUNT(*) FROM signals WHERE status='OPEN'"
+    ).fetchone()[0]
+    total = conn.execute(
+        "SELECT COUNT(*) FROM signals WHERE status IN ('TP1','TP2','STOP','EXPIRED')"
+    ).fetchone()[0]
+    tp2 = conn.execute(
+        "SELECT COUNT(*) FROM signals WHERE status='TP2'"
+    ).fetchone()[0]
+    tp1 = conn.execute(
+        "SELECT COUNT(*) FROM signals WHERE status='TP1'"
+    ).fetchone()[0]
+    stop = conn.execute(
+        "SELECT COUNT(*) FROM signals WHERE status='STOP'"
+    ).fetchone()[0]
+    expired = conn.execute(
+        "SELECT COUNT(*) FROM signals WHERE status='EXPIRED'"
+    ).fetchone()[0]
+    conn.close()
+    wins = tp1 + tp2
+    wr = (wins / total * 100) if total else 0.0
+    return total, tp2, tp1, stop, expired, open_count, wr
 
+# ---------------- MATH / INDICATORS ----------------
 
-async def guard(update):
-    if allowed(update):
-        return True
-    if update.effective_message:
-        await update.effective_message.reply_text("⛔ Yetkiniz yok.")
-    return False
-
-
-def api(path, params=None):
-    r = SESSION.get(BASE + path, params=params, timeout=15)
-    r.raise_for_status()
-    return r.json()
-
-
-def candles(symbol, timeframe, limit=180):
-    raw = api("/api/v3/klines", {
-        "symbol": symbol, "interval": timeframe, "limit": limit
-    })
-    out = []
-    for x in raw:
-        try:
-            out.append({
-                "t": int(x[0]), "o": float(x[1]), "h": float(x[2]),
-                "l": float(x[3]), "c": float(x[4]), "v": float(x[5])
-            })
-        except (ValueError, TypeError, IndexError):
-            continue
+def ema(values: List[float], n: int) -> List[float]:
+    if not values:
+        return []
+    k = 2 / (n + 1)
+    out = [values[0]]
+    for x in values[1:]:
+        out.append(x * k + out[-1] * (1 - k))
     return out
 
-
-def ema(v, n):
-    if len(v) < n:
-        return None
-    x = sum(v[:n]) / n
-    k = 2 / (n + 1)
-    for z in v[n:]:
-        x = z * k + x * (1 - k)
-    return x
-
-
-def rsi(v, n=14):
-    if len(v) <= n:
-        return 50.0
-    gains = losses = 0.0
-    for i in range(len(v) - n, len(v)):
-        d = v[i] - v[i - 1]
-        gains += max(d, 0.0)
-        losses += max(-d, 0.0)
-    if losses == 0:
-        return 100.0 if gains else 50.0
-    rs = gains / losses
-    return 100.0 - 100.0 / (1.0 + rs)
-
-
-def atr(c, n=14):
-    if len(c) < n + 1:
+def atr(cs: List[Candle], n: int = 14) -> float:
+    if len(cs) < n + 1:
         return 0.0
-    tr = []
-    for i in range(1, len(c)):
-        h, low, pc = c[i]["h"], c[i]["l"], c[i - 1]["c"]
-        tr.append(max(h - low, abs(h - pc), abs(low - pc)))
-    return sum(tr[-n:]) / n
+    trs = []
+    prev = cs[0].c
+    for x in cs[1:]:
+        trs.append(max(x.h - x.l, abs(x.h - prev), abs(x.l - prev)))
+        prev = x.c
+    return sum(trs[-n:]) / n
 
+def vwap(cs: List[Candle]) -> float:
+    pv = sum(((x.h + x.l + x.c) / 3) * x.v for x in cs)
+    vol = sum(x.v for x in cs)
+    return pv / vol if vol else cs[-1].c
 
-def vwap(c):
-    q = c[-60:]
-    vol = sum(x["v"] for x in q)
-    return sum(x["c"] * x["v"] for x in q) / vol if vol else q[-1]["c"]
+def slope(values: List[float], n: int = 8) -> float:
+    if len(values) < n + 1:
+        return 0.0
+    a = sum(values[-n:]) / n
+    b = sum(values[-2*n:-n]) / n
+    return (a - b) / (abs(b) or 1e-12)
 
-
-def volume_ok(c):
-    if len(c) < 22:
-        return False
-    avg = sum(x["v"] for x in c[-21:-1]) / 20
-    return bool(avg and c[-1]["v"] >= avg * 1.15)
-
-
-def structure(c):
-    if len(c) < 24:
-        return "NEUTRAL"
-    h = [x["h"] for x in c[-24:]]
-    l = [x["l"] for x in c[-24:]]
-    h_old, h_new = max(h[:12]), max(h[12:])
-    l_old, l_new = min(l[:12]), min(l[12:])
-    if h_new > h_old and l_new > l_old:
+def trend(cs: List[Candle]) -> str:
+    closes = [x.c for x in cs]
+    e20 = ema(closes, 20)[-1]
+    e50 = ema(closes, 50)[-1]
+    sl = slope(closes, 10)
+    if e20 > e50 and sl > 0:
         return "BULLISH"
-    if h_new < h_old and l_new < l_old:
+    if e20 < e50 and sl < 0:
         return "BEARISH"
     return "RANGE"
 
+def pivot_levels(cs: List[Candle], left: int = 3, right: int = 3):
+    highs, lows = [], []
+    for i in range(left, len(cs)-right):
+        h = cs[i].h
+        l = cs[i].l
+        if all(h > cs[j].h for j in range(i-left, i)) and all(h >= cs[j].h for j in range(i+1, i+right+1)):
+            highs.append(h)
+        if all(l < cs[j].l for j in range(i-left, i)) and all(l <= cs[j].l for j in range(i+1, i+right+1)):
+            lows.append(l)
+    return highs[-20:], lows[-20:]
 
-def pivots(c):
-    s, r = [], []
-    for i in range(2, len(c) - 2):
-        if c[i]["h"] >= max(c[i-2]["h"], c[i-1]["h"],
-                             c[i+1]["h"], c[i+2]["h"]):
-            r.append((c[i]["h"], c[i]["t"]))
-        if c[i]["l"] <= min(c[i-2]["l"], c[i-1]["l"],
-                             c[i+1]["l"], c[i+2]["l"]):
-            s.append((c[i]["l"], c[i]["t"]))
-    return s, r
+def nearest_sr(cs: List[Candle]) -> Tuple[float, float]:
+    price = cs[-1].c
+    highs, lows = pivot_levels(cs)
+    # Add recent extremes as fallback.
+    resistance_candidates = [x for x in highs if x > price * 1.001]
+    support_candidates = [x for x in lows if x < price * 0.999]
+    resistance = min(resistance_candidates, key=lambda x: x-price) if resistance_candidates else max(x.h for x in cs[-60:])
+    support = max(support_candidates, key=lambda x: price-x) if support_candidates else min(x.l for x in cs[-60:])
+    return support, resistance
 
-
-def clusters(levels, tol):
-    z = []
-    for p, t, w in sorted(levels):
-        if z and abs(p - z[-1]["p"]) <= tol:
-            q = z[-1]
-            q["p"] = (q["p"] * q["n"] + p) / (q["n"] + 1)
-            q["n"] += 1
-            q["w"] += w
-            q["t"] = max(q["t"], t)
+def volume_profile(cs: List[Candle], rows: int = 40):
+    lo = min(x.l for x in cs)
+    hi = max(x.h for x in cs)
+    if hi <= lo:
+        return cs[-1].c, hi, lo
+    step = (hi - lo) / rows
+    bins = [0.0] * rows
+    for x in cs:
+        typical = (x.h + x.l + x.c) / 3
+        idx = int((typical - lo) / step)
+        idx = max(0, min(rows-1, idx))
+        bins[idx] += x.v
+    poc_i = max(range(rows), key=lambda i: bins[i])
+    total = sum(bins)
+    target = total * 0.70
+    included = {poc_i}
+    acc = bins[poc_i]
+    up, down = poc_i + 1, poc_i - 1
+    while acc < target and (up < rows or down >= 0):
+        uv = bins[up] if up < rows else -1
+        dv = bins[down] if down >= 0 else -1
+        if uv >= dv:
+            if up < rows:
+                included.add(up); acc += bins[up]; up += 1
+            else:
+                included.add(down); acc += bins[down]; down -= 1
         else:
-            z.append({"p": p, "n": 1, "w": w, "t": t})
-    return z
+            if down >= 0:
+                included.add(down); acc += bins[down]; down -= 1
+            else:
+                included.add(up); acc += bins[up]; up += 1
+    poc = lo + (poc_i + 0.5) * step
+    vah = lo + (max(included) + 1) * step
+    val = lo + min(included) * step
+    return poc, vah, val
 
+def bos_state(cs: List[Candle], lookback: int = 8) -> str:
+    if len(cs) < lookback + 3:
+        return "NONE"
+    highs, lows = pivot_levels(cs[-min(len(cs), 80):], 2, 2)
+    price = cs[-1].c
+    if highs and price > highs[-1]:
+        return "BULLISH_BOS"
+    if lows and price < lows[-1]:
+        return "BEARISH_BOS"
+    return "NONE"
 
-def sr_map(frames):
-    weights = {"1d": 4, "4h": 3, "1h": 2, "15m": 1}
-    sup, res = [], []
-    for tf, c in frames.items():
-        if len(c) < 60:
-            continue
-        ps, pr = pivots(c)
-        sup += [(p, t, weights[tf]) for p, t in ps]
-        res += [(p, t, weights[tf]) for p, t in pr]
+def liquidity_sweep(cs: List[Candle]) -> str:
+    if len(cs) < 10:
+        return "NONE"
+    prior_high = max(x.h for x in cs[-10:-2])
+    prior_low = min(x.l for x in cs[-10:-2])
+    last = cs[-1]
+    # Sweep above high then close back below = bearish.
+    if last.h > prior_high and last.c < prior_high:
+        return "BEARISH_SWEEP"
+    # Sweep below low then close back above = bullish.
+    if last.l < prior_low and last.c > prior_low:
+        return "BULLISH_SWEEP"
+    return "NONE"
 
-    price = frames["15m"][-1]["c"]
-    tol = max(atr(frames["15m"]) * 0.55, price * 0.0018)
-    S = clusters(sup, tol)
-    R = clusters(res, tol)
+def fvg_state(cs: List[Candle]) -> str:
+    if len(cs) < 3:
+        return "NONE"
+    a, b, c = cs[-3], cs[-2], cs[-1]
+    if c.l > a.h:
+        return "BULLISH_FVG"
+    if c.h < a.l:
+        return "BEARISH_FVG"
+    return "NONE"
 
-    S = sorted(
-        [x for x in S if x["p"] <= price],
-        key=lambda x: (-x["w"], -x["p"])
-    )[:8]
-    R = sorted(
-        [x for x in R if x["p"] >= price],
-        key=lambda x: (-x["w"], x["p"])
-    )[:8]
-    return S, R
-
-
-def near(price, z, a):
-    return bool(
-        z and abs(price - z["p"]) <= max(a * 0.65, price * 0.002)
-    )
-
-
-def rejection(c, side):
-    x = c[-1]
-    body = abs(x["c"] - x["o"])
-    rng = max(x["h"] - x["l"], 1e-12)
-    lo = min(x["o"], x["c"]) - x["l"]
-    hi = x["h"] - max(x["o"], x["c"])
-    if side == "LONG":
-        return lo >= body * 1.15 and lo / rng >= 0.30 and x["c"] >= x["o"]
-    return hi >= body * 1.15 and hi / rng >= 0.30 and x["c"] <= x["o"]
-
-
-def sweep(c, side, level):
-    if level is None:
+def retest_state(cs: List[Candle], direction: str) -> bool:
+    if len(cs) < 8:
         return False
-    x = c[-1]
-    if side == "LONG":
-        return x["l"] < level and x["c"] > level
-    return x["h"] > level and x["c"] < level
+    e20 = ema([x.c for x in cs], 20)
+    recent = cs[-5:]
+    if direction == "LONG":
+        return any(x.l <= e20[-1] * 1.002 and x.c > e20[-1] for x in recent)
+    return any(x.h >= e20[-1] * 0.998 and x.c < e20[-1] for x in recent)
 
-
-def retest(c, side, level):
-    if level is None or len(c) < 5:
+def vol_confirmation(cs: List[Candle]) -> bool:
+    if len(cs) < 25:
         return False
-    a, x = c[-4], c[-1]
-    if side == "LONG":
-        return a["c"] > level and x["l"] <= level * 1.003 and x["c"] > level
-    return a["c"] < level and x["h"] >= level * 0.997 and x["c"] < level
+    avg = sum(x.v for x in cs[-21:-1]) / 20
+    return cs[-1].v >= avg * 1.15
 
-
-def bos(c, side):
-    if len(c) < 12:
-        return False
-    x = c[-1]
-    prior = c[-7:-1]
-    if side == "LONG":
-        return x["c"] > max(z["h"] for z in prior)
-    return x["c"] < min(z["l"] for z in prior)
-
-
-def fvg(c, side):
-    if len(c) < 4:
-        return False
-    a, b, x = c[-3], c[-2], c[-1]
-    if side == "LONG":
-        return x["l"] > a["h"] and b["c"] > b["o"]
-    return x["h"] < a["l"] and b["c"] < b["o"]
-
-
-def two_min(m):
+def aggregate_2m(one_minute: List[Candle]) -> List[Candle]:
     out = []
-    for i in range(0, len(m) - 1, 2):
-        a, b = m[i], m[i + 1]
-        if b["t"] != a["t"] + 60000:
+    i = 0
+    while i + 1 < len(one_minute):
+        a, b = one_minute[i], one_minute[i+1]
+        if b.ts - a.ts > 70_000:
+            i += 1
             continue
-        out.append({
-            "t": a["t"], "o": a["o"], "h": max(a["h"], b["h"]),
-            "l": min(a["l"], b["l"]), "c": b["c"], "v": a["v"] + b["v"]
-        })
+        out.append(Candle(
+            ts=a.ts,
+            o=a.o,
+            h=max(a.h, b.h),
+            l=min(a.l, b.l),
+            c=b.c,
+            v=a.v + b.v
+        ))
+        i += 2
     return out
 
+# ---------------- BINANCE ----------------
 
-def analyze(sym):
-    try:
-        F = {
-            tf: candles(sym, tf)
-            for tf in ("1d", "4h", "1h", "15m")
-        }
-        if any(len(c) < 70 for c in F.values()):
-            return None, "MTF"
+class Binance:
+    def __init__(self):
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.sem = asyncio.Semaphore(8)
 
-        m = two_min(candles(sym, "1m", 140))
-        if len(m) < 45:
-            return None, "2m"
-
-        price = F["15m"][-1]["c"]
-        a = atr(F["15m"])
-        if not a:
-            return None, "ATR"
-
-        S, R = sr_map(F)
-        s = S[0] if S else None
-        r = R[0] if R else None
-
-        regs = {tf: structure(c) for tf, c in F.items()}
-        mtf_bull = sum(regs[tf] == "BULLISH" for tf in ("1d", "4h", "1h"))
-        mtf_bear = sum(regs[tf] == "BEARISH" for tf in ("1d", "4h", "1h"))
-
-        mv = [x["c"] for x in m]
-        e9, e20 = ema(mv, 9), ema(mv, 20)
-        rsi2 = rsi(mv)
-        vw = vwap(F["15m"])
-        vol = volume_ok(F["15m"])
-
-        lp, sp = 0, 0
-        lr, sr = [], []
-
-        # HTF: strong alignment matters more than oscillator score.
-        if mtf_bull == 3:
-            lp += 25; lr.append("HTF aligned bullish")
-        elif mtf_bull == 2 and mtf_bear == 0:
-            lp += 15; lr.append("HTF mostly bullish")
-
-        if mtf_bear == 3:
-            sp += 25; sr.append("HTF aligned bearish")
-        elif mtf_bear == 2 and mtf_bull == 0:
-            sp += 15; sr.append("HTF mostly bearish")
-
-        ns = near(price, s, a)
-        nr = near(price, r, a)
-
-        if ns:
-            lp += 24; lr.append("SUPPORT ZONE")
-        if nr:
-            sp += 24; sr.append("RESISTANCE ZONE")
-
-        if s and rejection(F["15m"], "LONG"):
-            lp += 10; lr.append("support rejection")
-        if r and rejection(F["15m"], "SHORT"):
-            sp += 10; sr.append("resistance rejection")
-
-        if s and sweep(F["15m"], "LONG", s["p"]):
-            lp += 12; lr.append("liquidity sweep")
-        if r and sweep(F["15m"], "SHORT", r["p"]):
-            sp += 12; sr.append("liquidity sweep")
-
-        if s and retest(F["15m"], "LONG", s["p"]):
-            lp += 10; lr.append("support retest")
-        if r and retest(F["15m"], "SHORT", r["p"]):
-            sp += 10; sr.append("resistance retest")
-
-        if bos(m, "LONG"):
-            lp += 8; lr.append("2m BOS")
-        if bos(m, "SHORT"):
-            sp += 8; sr.append("2m BOS")
-
-        if fvg(m, "LONG"):
-            lp += 4; lr.append("2m FVG")
-        if fvg(m, "SHORT"):
-            sp += 4; sr.append("2m FVG")
-
-        if e9 and e20 and e9 > e20 and rsi2 >= 52:
-            lp += 6; lr.append("2m momentum")
-        if e9 and e20 and e9 < e20 and rsi2 <= 48:
-            sp += 6; sr.append("2m momentum")
-
-        if price > vw:
-            lp += 4; lr.append("above VWAP")
-        elif price < vw:
-            sp += 4; sr.append("below VWAP")
-
-        if vol:
-            if lp >= sp:
-                lp += 4; lr.append("volume confirmation")
-            else:
-                sp += 4; sr.append("volume confirmation")
-
-        if lp >= sp:
-            side, score, reasons, zone = "LONG", min(100, int(lp)), lr, s
-        else:
-            side, score, reasons, zone = "SHORT", min(100, int(sp)), sr, r
-
-        # Hard contradiction gate.
-        if side == "LONG":
-            contradiction = mtf_bear >= 2
-        else:
-            contradiction = mtf_bull >= 2
-
-        if contradiction:
-            return {
-                "symbol": sym, "side": side, "score": score, "ready": False,
-                "entry": price, "stop": price, "tp1": price, "tp2": price,
-                "support": s["p"] if s else None,
-                "resistance": r["p"] if r else None,
-                "regimes": regs, "reasons": reasons + ["HTF CONTRADICTION"],
-                "volume": vol, "blocked": "HTF contradiction"
-            }, None
-
-        if zone is None:
-            return {
-                "symbol": sym, "side": side, "score": score, "ready": False,
-                "entry": price, "stop": price, "tp1": price, "tp2": price,
-                "support": s["p"] if s else None,
-                "resistance": r["p"] if r else None,
-                "regimes": regs, "reasons": reasons,
-                "volume": vol, "blocked": "No S/R zone"
-            }, None
-
-        # Require a real location + price-action confirmation.
-        location_ok = near(price, zone, a)
-        event_ok = (
-            rejection(F["15m"], side)
-            or sweep(F["15m"], side, zone["p"])
-            or retest(F["15m"], side, zone["p"])
-            or bos(m, side)
+    async def start(self):
+        self.session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=20),
+            headers={"User-Agent": "ATLAS-AI-V9/1.0"}
         )
 
-        # Avoid buying directly into resistance / selling directly into support.
-        if side == "LONG" and nr and not ns:
-            event_ok = False
-        if side == "SHORT" and ns and not nr:
-            event_ok = False
+    async def close(self):
+        if self.session:
+            await self.session.close()
 
-        if not (score >= THRESHOLD and location_ok and event_ok):
-            return {
-                "symbol": sym, "side": side, "score": score, "ready": False,
-                "entry": price, "stop": price, "tp1": price, "tp2": price,
-                "support": s["p"] if s else None,
-                "resistance": r["p"] if r else None,
-                "regimes": regs, "reasons": reasons,
-                "volume": vol, "blocked": "Confluence incomplete"
-            }, None
+    async def get_json(self, path, params=None):
+        assert self.session
+        url = BINANCE_BASE + path
+        async with self.sem:
+            for attempt in range(3):
+                try:
+                    async with self.session.get(url, params=params) as r:
+                        if r.status == 429:
+                            await asyncio.sleep(2 + attempt * 2)
+                            continue
+                        r.raise_for_status()
+                        return await r.json()
+                except Exception:
+                    if attempt == 2:
+                        raise
+                    await asyncio.sleep(1 + attempt)
+        return None
 
-        # ATR-based stop. Targets are intentionally wider for multi-hour/day holds.
-        entry = price
-        if side == "LONG":
-            stop = min(zone["p"] - 0.45 * a, entry - 1.05 * a)
-            risk = max(entry - stop, entry * 0.003)
-            tp1 = entry + 1.75 * risk
-            tp2 = entry + 3.0 * risk
-        else:
-            stop = max(zone["p"] + 0.45 * a, entry + 1.05 * a)
-            risk = max(stop - entry, entry * 0.003)
-            tp1 = entry - 1.75 * risk
-            tp2 = entry - 3.0 * risk
+    async def symbols(self, limit=80):
+        data = await self.get_json("/api/v3/ticker/24hr")
+        if not isinstance(data, list):
+            return []
+        candidates = []
+        for x in data:
+            s = x.get("symbol", "")
+            if not s.endswith("USDT"):
+                continue
+            if any(s.endswith(z) for z in ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")):
+                continue
+            try:
+                qv = float(x.get("quoteVolume", 0))
+                price = float(x.get("lastPrice", 0))
+                if qv > 0 and price > 0:
+                    candidates.append((qv, s))
+            except Exception:
+                pass
+        candidates.sort(reverse=True)
+        return [s for _, s in candidates[:limit]]
 
-        stop_pct = abs(entry - stop) / entry
-        tp2_pct = abs(tp2 - entry) / entry
-        rr = tp2_pct / stop_pct if stop_pct else 0.0
+    async def klines(self, symbol, interval, limit):
+        data = await self.get_json(
+            "/api/v3/klines",
+            {"symbol": symbol, "interval": interval, "limit": limit}
+        )
+        out = []
+        for x in data or []:
+            out.append(Candle(
+                ts=int(x[0]),
+                o=float(x[1]),
+                h=float(x[2]),
+                l=float(x[3]),
+                c=float(x[4]),
+                v=float(x[5]),
+            ))
+        return out
 
-        if stop_pct > MAX_STOP_PCT:
-            return {
-                "symbol": sym, "side": side, "score": score, "ready": False,
-                "entry": entry, "stop": stop, "tp1": tp1, "tp2": tp2,
-                "support": s["p"], "resistance": r["p"],
-                "regimes": regs, "reasons": reasons,
-                "volume": vol, "blocked": "Stop too wide"
-            }, None
+# ---------------- V9 DECISION ENGINE ----------------
 
-        if rr < MIN_RR or tp2_pct < MIN_TP2_PCT:
-            return {
-                "symbol": sym, "side": side, "score": score, "ready": False,
-                "entry": entry, "stop": stop, "tp1": tp1, "tp2": tp2,
-                "support": s["p"], "resistance": r["p"],
-                "regimes": regs, "reasons": reasons,
-                "volume": vol, "blocked": "Expected move too small"
-            }, None
+def directional_votes(csets: Dict[str, List[Candle]]):
+    dirs = {}
+    for tf in ("1d", "4h", "1h", "15m"):
+        dirs[tf] = trend(csets[tf])
+    return dirs
 
-        reasons.append("PRO CONFLUENCE")
-        reasons.append(f"TP2 potential {tp2_pct * 100:.1f}%")
+def analyze(symbol: str, csets: Dict[str, List[Candle]]) -> Optional[Analysis]:
+    d = directional_votes(csets)
+    d1, h4, h1, m15 = d["1d"], d["4h"], d["1h"], d["15m"]
 
-        return {
-            "symbol": sym, "side": side, "score": score, "ready": True,
-            "entry": entry, "stop": stop, "tp1": tp1, "tp2": tp2,
-            "support": s["p"], "resistance": r["p"],
-            "regimes": regs, "reasons": reasons[:9], "volume": vol,
-            "rr": rr, "tp2_pct": tp2_pct, "blocked": ""
-        }, None
+    # 1D is the regime. We do not trade directly against it.
+    if d1 == "RANGE":
+        regime = "RANGE"
+    else:
+        regime = d1
 
-    except Exception as e:
-        return None, f"{type(e).__name__}: {e}"
+    votes = {"LONG": 0, "SHORT": 0}
+    if d1 == "BULLISH": votes["LONG"] += 22
+    if d1 == "BEARISH": votes["SHORT"] += 22
+    if h4 == "BULLISH": votes["LONG"] += 18
+    if h4 == "BEARISH": votes["SHORT"] += 18
+    if h1 == "BULLISH": votes["LONG"] += 14
+    if h1 == "BEARISH": votes["SHORT"] += 14
+    if m15 == "BULLISH": votes["LONG"] += 10
+    if m15 == "BEARISH": votes["SHORT"] += 10
 
+    direction = "LONG" if votes["LONG"] >= votes["SHORT"] else "SHORT"
 
-def universe():
-    info = api("/api/v3/exchangeInfo")
-    allowed_symbols = {
-        x["symbol"] for x in info.get("symbols", [])
-        if x.get("status") == "TRADING"
-        and x.get("quoteAsset") == "USDT"
-        and x.get("isSpotTradingAllowed", False)
-    }
+    # If 1D is clear, block direct opposition.
+    if regime == "BULLISH" and direction == "SHORT":
+        direction = "LONG"
+    if regime == "BEARISH" and direction == "LONG":
+        direction = "SHORT"
 
-    banned_words = ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")
-    rows = []
+    c4, c1, c15 = csets["4h"], csets["1h"], csets["15m"]
+    c2 = csets.get("2m", [])
 
-    for t in api("/api/v3/ticker/24hr"):
-        s = t.get("symbol")
-        try:
-            q = float(t.get("quoteVolume") or 0)
-        except (ValueError, TypeError):
-            continue
+    support, resistance = nearest_sr(c4 + c1[-80:])
+    poc, vah, val = volume_profile(c4[-160:])
+    vw = vwap(c15[-80:])
+    a = atr(c15, 14)
+    price = c15[-1].c
 
-        if (
-            s in allowed_symbols and q > 0
-            and not any(s.endswith(x) for x in banned_words)
-        ):
-            rows.append((q, s))
+    structure = bos_state(c4)
+    setup = bos_state(c1)
+    sweep = liquidity_sweep(c15)
+    fvg = fvg_state(c15)
+    vol_ok = vol_confirmation(c15)
+    retest = retest_state(c1, direction)
 
-    rows.sort(reverse=True)
-    return [s for _, s in rows[:UNIVERSE_SIZE]]
+    score = 0
+    reasons = []
 
+    # Directional alignment
+    aligned = 0
+    for x in (d1, h4, h1, m15):
+        if (direction == "LONG" and x == "BULLISH") or (direction == "SHORT" and x == "BEARISH"):
+            aligned += 1
+    score += aligned * 9
+    if aligned >= 3:
+        reasons.append("MTF alignment")
 
-def scan():
-    U, out, errors = universe(), [], 0
+    if direction == "LONG":
+        if structure == "BULLISH_BOS": score += 10; reasons.append("4H BOS")
+        if setup == "BULLISH_BOS": score += 9; reasons.append("1H BOS")
+        if sweep == "BULLISH_SWEEP": score += 12; reasons.append("15M liquidity sweep")
+        if fvg == "BULLISH_FVG": score += 7; reasons.append("bullish FVG")
+        if price >= vw: score += 6; reasons.append("above VWAP")
+        if retest: score += 7; reasons.append("retest")
+        if vol_ok: score += 5; reasons.append("volume")
+        if price >= val and price <= poc * 1.003: score += 5; reasons.append("value-area support")
+    else:
+        if structure == "BEARISH_BOS": score += 10; reasons.append("4H BOS")
+        if setup == "BEARISH_BOS": score += 9; reasons.append("1H BOS")
+        if sweep == "BEARISH_SWEEP": score += 12; reasons.append("15M liquidity sweep")
+        if fvg == "BEARISH_FVG": score += 7; reasons.append("bearish FVG")
+        if price <= vw: score += 6; reasons.append("below VWAP")
+        if retest: score += 7; reasons.append("retest")
+        if vol_ok: score += 5; reasons.append("volume")
+        if price <= vah and price >= poc * 0.997: score += 5; reasons.append("value-area resistance")
 
-    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        futures = {pool.submit(analyze, s): s for s in U}
-        for f in as_completed(futures):
-            d, e = f.result()
-            if d:
-                out.append(d)
-            else:
-                errors += 1
+    # 2M is not allowed to override 15M. It can only add a small trigger bonus.
+    trigger2 = trend(c2) if c2 else "NONE"
+    if direction == "LONG" and trigger2 == "BULLISH":
+        score += 3
+    if direction == "SHORT" and trigger2 == "BEARISH":
+        score += 3
 
-    out.sort(key=lambda x: (x["ready"], x["score"]), reverse=True)
-    return U, out, errors
+    # Entry is current 15M close. Stop is structure/ATR based.
+    if direction == "LONG":
+        structural_stop = min(support, price - 1.15 * a)
+        stop = min(price - 0.8 * a, structural_stop)
+        risk = price - stop
+        tp1 = price + max(1.6 * risk, 0.012 * price)
+        tp2 = price + max(2.5 * risk, 0.025 * price)
+        next_res = resistance
+        if next_res > price and next_res < tp2:
+            tp2 = next_res * 0.997
+    else:
+        structural_stop = max(resistance, price + 1.15 * a)
+        stop = max(price + 0.8 * a, structural_stop)
+        risk = stop - price
+        tp1 = price - max(1.6 * risk, 0.012 * price)
+        tp2 = price - max(2.5 * risk, 0.025 * price)
+        next_sup = support
+        if next_sup < price and next_sup > tp2:
+            tp2 = next_sup * 1.003
 
+    if risk <= 0:
+        return None
 
-def fmt_price(value):
-    if value is None:
-        return "-"
-    av = abs(value)
-    if av >= 1000:
-        return f"{value:,.2f}"
-    if av >= 1:
-        return f"{value:.5f}"
-    if av >= 0.01:
-        return f"{value:.6f}"
-    if av >= 0.0001:
-        return f"{value:.8f}"
-    return f"{value:.12f}".rstrip("0").rstrip(".")
+    rr = abs(tp2 - price) / risk
+    stop_pct = risk / price * 100
+    tp2_pct = abs(tp2 - price) / price * 100
 
+    if stop_pct > MAX_STOP_PCT:
+        score -= 8
+        reasons.append("wide stop")
+    if rr >= MIN_RR:
+        score += 6
+        reasons.append(f"RR {rr:.1f}")
+    else:
+        score -= 10
+        reasons.append("RR weak")
+    if tp2_pct >= MIN_TP2_PCT:
+        score += 5
+        reasons.append(f"TP2 {tp2_pct:.1f}%")
+    else:
+        score -= 10
+        reasons.append("TP2 too close")
 
-def signal_text(x):
-    side = "🟢 LONG / AL" if x["side"] == "LONG" else "🔴 SHORT / SAT"
+    # Hard contradiction: 1D vs trade direction.
+    contradiction = (
+        (direction == "LONG" and d1 == "BEARISH") or
+        (direction == "SHORT" and d1 == "BULLISH")
+    )
+    if contradiction:
+        score -= 30
+        reasons.append("HTF contradiction")
+
+    score = max(0, min(100, int(score)))
+
+    if score >= READY_SCORE and not contradiction and rr >= MIN_RR and tp2_pct >= MIN_TP2_PCT:
+        status = "READY"
+    elif score >= WATCH_SCORE:
+        status = "WATCH"
+    else:
+        status = "IGNORE"
+
+    tv = f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}"
+
+    return Analysis(
+        symbol=symbol,
+        direction=direction,
+        score=score,
+        status=status,
+        reason=", ".join(reasons[:8]) or "Confluence incomplete",
+        entry=price,
+        stop=stop,
+        tp1=tp1,
+        tp2=tp2,
+        rr=rr,
+        support=support,
+        resistance=resistance,
+        vwap=vw,
+        poc=poc,
+        vah=vah,
+        val=val,
+        atr=a,
+        htf=f"1D {d1} | 4H {h4} | 1H {h1} | 15M {m15}",
+        structure_4h=structure,
+        setup_1h=setup,
+        trigger_15m=f"{sweep} / {fvg}",
+        trigger_2m=trigger2,
+        tv_url=tv,
+    )
+
+# ---------------- TELEGRAM ----------------
+
+def fmt_price(x: float) -> str:
+    if x == 0:
+        return "0"
+    if abs(x) >= 100:
+        return f"{x:.3f}"
+    if abs(x) >= 1:
+        return f"{x:.5f}"
+    if abs(x) >= 0.01:
+        return f"{x:.6f}"
+    return f"{x:.8g}"
+
+def signal_text(a: Analysis):
+    icon = "🟢" if a.direction == "LONG" else "🔴"
+    side = "LONG / AL" if a.direction == "LONG" else "SHORT / SAT"
     return (
-        "🎯 ATLAS AI V8 PRO SIGNAL\n\n"
-        f"{x['symbol']} — {side}\n"
-        f"Skor: {x['score']}/100 | RR: 1:{x['rr']:.1f}\n"
-        f"TP2 potansiyeli: {x['tp2_pct'] * 100:.1f}%\n\n"
-        f"📍 Entry: {fmt_price(x['entry'])}\n"
-        f"🛑 Stop: {fmt_price(x['stop'])}\n"
-        f"🎯 TP1: {fmt_price(x['tp1'])}\n"
-        f"🎯 TP2: {fmt_price(x['tp2'])}\n\n"
-        f"🟢 Destek: {fmt_price(x['support'])}\n"
-        f"🔴 Direnç: {fmt_price(x['resistance'])}\n\n"
-        f"MTF: 1D {x['regimes']['1d']} | "
-        f"4H {x['regimes']['4h']} | "
-        f"1H {x['regimes']['1h']} | "
-        f"15M {x['regimes']['15m']}\n"
-        "2M giriş: teyitli\n"
-        f"Volume: {'YES' if x['volume'] else 'NO'}\n"
-        f"Neden: {', '.join(x['reasons'])}\n\n"
-        "🧠 ATLAS kalite filtresinden geçti.\n"
-        "⚠️ Araştırma/paper sinyali. Kâr garantisi yoktur."
+        f"🎯 ATLAS AI V9 SIGNAL\n\n"
+        f"{a.symbol} — {icon} {side}\n"
+        f"Skor: {a.score}/100\n\n"
+        f"Entry: {fmt_price(a.entry)}\n"
+        f"Stop: {fmt_price(a.stop)}\n"
+        f"TP1: {fmt_price(a.tp1)}\n"
+        f"TP2: {fmt_price(a.tp2)}\n\n"
+        f"🟢 Destek: {fmt_price(a.support)}\n"
+        f"🔴 Direnç: {fmt_price(a.resistance)}\n"
+        f"POC: {fmt_price(a.poc)} | VAH: {fmt_price(a.vah)} | VAL: {fmt_price(a.val)}\n"
+        f"VWAP: {fmt_price(a.vwap)}\n\n"
+        f"MTF: {a.htf}\n"
+        f"4H yapı: {a.structure_4h}\n"
+        f"1H setup: {a.setup_1h}\n"
+        f"15M trigger: {a.trigger_15m}\n"
+        f"2M kaçırmama: {a.trigger_2m}\n\n"
+        f"RR: 1:{a.rr:.1f}\n"
+        f"Neden: {a.reason}\n\n"
+        f"⚠️ Araştırma/paper sinyali. Kâr garantisi yoktur."
     )
 
-
-def save_signal(x):
-    con = db()
-    con.execute("""
-        INSERT INTO signals
-        (ts, symbol, side, score, entry, stop, tp1, tp2,
-         support, resistance, reason)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        int(time.time()), x["symbol"], x["side"], x["score"],
-        x["entry"], x["stop"], x["tp1"], x["tp2"],
-        x["support"], x["resistance"], ", ".join(x["reasons"])
-    ))
-    con.commit()
-    con.close()
-
-
-async def send_signal(app, x):
-    if not SIGNAL_CHAT_ID:
-        state["errors"] += 1
-        state["last_error"] = "SIGNAL_CHAT_ID boş."
-        return False
-
-    key = f"{x['symbol']}:{x['side']}"
-    now = time.time()
-    if now - sent[key] < COOLDOWN:
-        return False
-
-    try:
-        tv_url = (
-            "https://www.tradingview.com/chart/"
-            f"?symbol=BINANCE:{x['symbol']}&interval=15"
-        )
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("📈 TradingView'de Aç", url=tv_url)
-        ]])
-
-        await app.bot.send_message(
-            chat_id=SIGNAL_CHAT_ID,
-            text=signal_text(x),
-            reply_markup=keyboard
-        )
-
-        save_signal(x)
-        sent[key] = now
-        state["signals"] += 1
-        log.info("Signal sent to %s: %s %s",
-                 SIGNAL_CHAT_ID, x["symbol"], x["side"])
-        return True
-
-    except Exception as e:
-        state["errors"] += 1
-        state["last_error"] = f"SIGNAL: {type(e).__name__}: {e}"
-        log.exception("Signal send failed")
-        return False
-
-
-def current_price(symbol):
-    data = api("/api/v3/ticker/price", {"symbol": symbol})
-    return float(data["price"])
-
-
-def evaluate_open_signals():
-    con = db()
-    rows = con.execute("""
-        SELECT id, ts, symbol, side, entry, stop, tp1, tp2
-        FROM signals
-        WHERE status = 'OPEN'
-        ORDER BY id
-    """).fetchall()
-
-    closed = 0
-    for row in rows:
-        sid, ts, symbol, side, entry, stop, tp1, tp2 = row
-
-        if time.time() - ts > TRACK_HOURS * 3600:
-            con.execute(
-                "UPDATE signals SET status='EXPIRED', closed_ts=?, close_price=? WHERE id=?",
-                (int(time.time()), current_price(symbol), sid)
-            )
-            closed += 1
-            continue
-
-        try:
-            p = current_price(symbol)
-        except Exception:
-            continue
-
-        if side == "LONG":
-            if p <= stop:
-                status = "STOP"
-            elif p >= tp2:
-                status = "TP2"
-            elif p >= tp1:
-                status = "TP1"
-            else:
-                continue
-        else:
-            if p >= stop:
-                status = "STOP"
-            elif p <= tp2:
-                status = "TP2"
-            elif p <= tp1:
-                status = "TP1"
-            else:
-                continue
-
-        con.execute(
-            "UPDATE signals SET status=?, closed_ts=?, close_price=? WHERE id=?",
-            (status, int(time.time()), p, sid)
-        )
-        closed += 1
-
-    con.commit()
-    con.close()
-    return closed
-
-
-async def tracker():
-    while True:
-        try:
-            await asyncio.to_thread(evaluate_open_signals)
-        except Exception as e:
-            state["errors"] += 1
-            state["last_error"] = f"TRACKER: {type(e).__name__}: {e}"
-        await asyncio.sleep(max(60, SCAN_INTERVAL))
-
-
-async def do_scan(app):
-    if scan_lock.locked():
-        return
-
-    async with scan_lock:
-        state["running"] = True
-        try:
-            U, R, E = await asyncio.to_thread(scan)
-
-            ready = [x for x in R if x["ready"]]
-            blocked = [x for x in R if not x["ready"]]
-
-            state.update(
-                scans=state["scans"] + 1,
-                last=time.time(),
-                universe=len(U),
-                scanned=len(R),
-                ready=len(ready),
-                errors=E,
-                skipped=len(U) - len(R),
-                blocked_quality=len(blocked),
-                last_error="",
-                top=R[:5]
-            )
-
-            for x in ready:
-                await send_signal(app, x)
-
-        except Exception as e:
-            state["errors"] += 1
-            state["last_error"] = f"{type(e).__name__}: {e}"
-            log.exception("Scan failed")
-        finally:
-            state["running"] = False
-
-
-async def scanner(app):
-    await asyncio.sleep(3)
-    while True:
-        await do_scan(app)
-        await asyncio.sleep(SCAN_INTERVAL)
-
-
-async def start(update: Update, context):
-    if not await guard(update):
-        return
-    await update.effective_message.reply_text(
-        "🚀 ATLAS AI V8\n"
-        "Self-checking PRO radar aktif.\n"
-        f"Tarama: {SCAN_INTERVAL}s | Universe: {UNIVERSE_SIZE}\n"
-        f"Threshold: {THRESHOLD} | Min RR: 1:{MIN_RR}\n"
-        f"Min TP2: {MIN_TP2_PCT * 100:.1f}% | Max stop: {MAX_STOP_PCT * 100:.1f}%\n"
-        f"📡 Kanal: {SIGNAL_CHAT_ID or 'AYARLANMADI'}"
+async def send_signal(bot, a: Analysis):
+    keyboard = [[InlineKeyboardButton("📈 TradingView'de Aç", url=a.tv_url)]]
+    await bot.send_message(
+        chat_id=SIGNAL_CHAT,
+        text=signal_text(a),
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-
-async def status(update: Update, context):
-    if not await guard(update):
-        return
-
-    last = "yok" if not state["last"] else f"{int(time.time()-state['last'])}s önce"
-    await update.effective_message.reply_text(
-        "🧭 ATLAS AI V8 STATUS\n"
-        f"Tarama: {state['scans']}\n"
-        f"Son tarama: {last}\n"
-        f"Universe: {state['universe']}\n"
-        f"Taranan: {state['scanned']}\n"
-        f"TRADE READY: {state['ready']}\n"
-        f"Toplam sinyal: {state['signals']}\n"
-        f"Açık takip: {open_count()}\n"
-        f"Hata: {state['errors']}\n"
-        f"Atlanan: {state['skipped']}\n"
-        f"Son hata: {state['last_error'] or 'Yok'}"
+async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🧪 ATLAS AI V9 TEST OK\n"
+        "Binance REST: hazır\n"
+        f"Signal chat: {SIGNAL_CHAT}\n"
+        "Timeframes: 1D → 4H → 1H → 15M | 2M anti-miss\n"
+        "Mode: paper signals only"
     )
 
-
-def open_count():
-    con = db()
-    n = con.execute(
-        "SELECT COUNT(*) FROM signals WHERE status='OPEN'"
-    ).fetchone()[0]
-    con.close()
-    return n
-
-
-async def diagnostics(update: Update, context):
-    if not await guard(update):
-        return
-
-    last = "yok" if not state["last"] else f"{int(time.time()-state['last'])}s önce"
-    lines = [
-        "🛠 ATLAS AI V8 DIAGNOSTICS",
-        "",
-        f"Tarama: {state['scans']}",
-        f"Son tarama: {last}",
-        f"Universe: {state['universe']}",
-        f"Taranan: {state['scanned']}",
-        f"TRADE READY: {state['ready']}",
-        f"Kalite filtresinden kalan WATCH: {state['blocked_quality']}",
-        f"Toplam sinyal: {state['signals']}",
-        f"Açık takip: {open_count()}",
-        f"Hata: {state['errors']}",
-        f"Atlanan: {state['skipped']}",
-        f"Durum: {'SCANNING' if state['running'] else 'IDLE'}",
-        f"SIGNAL CHAT: {SIGNAL_CHAT_ID or 'AYARLANMADI'}",
-        f"Min RR: 1:{MIN_RR}",
-        f"Min TP2: {MIN_TP2_PCT*100:.1f}%",
-        "",
-        "🏆 TOP 5"
-    ]
-
-    for i, x in enumerate(state["top"], 1):
-        tag = "READY" if x["ready"] else f"WATCH — {x.get('blocked','')}"
-        lines.append(
-            f"{i}. {x['symbol']} {x['side']} {x['score']}/100 {tag}"
-        )
-
-    await update.effective_message.reply_text("\n".join(lines))
-
-
-async def performance(update: Update, context):
-    if not await guard(update):
-        return
-
-    con = db()
-    total = con.execute(
-        "SELECT COUNT(*) FROM signals WHERE status!='OPEN'"
-    ).fetchone()[0]
-    tp2 = con.execute(
-        "SELECT COUNT(*) FROM signals WHERE status='TP2'"
-    ).fetchone()[0]
-    tp1 = con.execute(
-        "SELECT COUNT(*) FROM signals WHERE status='TP1'"
-    ).fetchone()[0]
-    stop = con.execute(
-        "SELECT COUNT(*) FROM signals WHERE status='STOP'"
-    ).fetchone()[0]
-    expired = con.execute(
-        "SELECT COUNT(*) FROM signals WHERE status='EXPIRED'"
-    ).fetchone()[0]
-    open_n = con.execute(
-        "SELECT COUNT(*) FROM signals WHERE status='OPEN'"
-    ).fetchone()[0]
-    con.close()
-
-    decisive = tp2 + tp1 + stop
-    win_rate = ((tp2 + tp1) / decisive * 100) if decisive else 0.0
-
-    await update.effective_message.reply_text(
-        "📊 ATLAS AI V8 PERFORMANCE\n\n"
+async def cmd_performance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    total, tp2, tp1, stop, expired, opened, wr = performance()
+    await update.message.reply_text(
+        "📊 ATLAS AI V9 PERFORMANCE\n\n"
         f"Sonuçlanan: {total}\n"
         f"TP2: {tp2}\n"
         f"TP1: {tp1}\n"
         f"STOP: {stop}\n"
         f"EXPIRED: {expired}\n"
-        f"Açık: {open_n}\n"
-        f"Win rate* : {win_rate:.1f}%\n\n"
-        "*Paper-trade takip oranı; gerçek kâr garantisi değildir."
+        f"Açık: {opened}\n"
+        f"Win rate*: {wr:.1f}%\n\n"
+        "*Paper-trade istatistiğidir; gerçek kâr garantisi değildir."
     )
 
+async def cmd_diagnostics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🛠️ ATLAS AI V9 DIAGNOSTICS\n\n"
+        f"Universe: {UNIVERSE_SIZE} USDT pairs\n"
+        "Decision TF: 1D / 4H / 1H / 15M\n"
+        "2M: entry / anti-miss only\n"
+        f"Ready threshold: {READY_SCORE}\n"
+        f"Watch threshold: {WATCH_SCORE}\n"
+        f"Min RR: 1:{MIN_RR}\n"
+        f"Min TP2: {MIN_TP2_PCT}%\n"
+        f"Signal chat: {SIGNAL_CHAT}\n"
+        "Execution: OFF (paper only)"
+    )
 
-async def test(update: Update, context):
-    if not await guard(update):
-        return
+# ---------------- SCANNER ----------------
 
-    try:
-        d = candles("BTCUSDT", "1m", 3)
-        await update.effective_message.reply_text(
-            "🧪 TEST OK\n"
-            f"Binance: {'✅' if len(d) == 3 else '⚠️'}\n"
-            f"BTCUSDT 1m: {len(d)}\n"
-            f"Signal channel: {SIGNAL_CHAT_ID or 'AYARLANMADI'}\n"
-            f"Database: {'✅' if Path(DB_PATH).exists() else '⚠️'}"
-        )
-    except Exception as e:
-        await update.effective_message.reply_text(
-            f"❌ TEST ERROR: {type(e).__name__}: {e}"
-        )
+class Scanner:
+    def __init__(self, bn: Binance, app: Application):
+        self.bn = bn
+        self.app = app
+        self.last_sent = {}  # symbol -> timestamp
 
+    async def load_symbol(self, symbol):
+        # Actual decision stack.
+        tasks = [
+            self.bn.klines(symbol, "1d", TF_LIMITS["1d"]),
+            self.bn.klines(symbol, "4h", TF_LIMITS["4h"]),
+            self.bn.klines(symbol, "1h", TF_LIMITS["1h"]),
+            self.bn.klines(symbol, "15m", TF_LIMITS["15m"]),
+        ]
+        d, h4, h1, m15 = await asyncio.gather(*tasks, return_exceptions=True)
+        if any(isinstance(x, Exception) or not x for x in (d, h4, h1, m15)):
+            return None
+        # Only fetch 1m for candidates after initial analysis.
+        return {"1d": d, "4h": h4, "1h": h1, "15m": m15}
 
-async def post_init(app):
-    global scan_task, tracker_task
-    db().close()
-    scan_task = asyncio.create_task(scanner(app))
-    tracker_task = asyncio.create_task(tracker())
+    async def scan_once(self):
+        symbols = await self.bn.symbols(UNIVERSE_SIZE)
+        if not symbols:
+            log.warning("No symbols received.")
+            return
 
+        results = []
+        for i in range(0, len(symbols), 8):
+            batch = symbols[i:i+8]
+            loaded = await asyncio.gather(
+                *(self.load_symbol(s) for s in batch),
+                return_exceptions=True
+            )
+            for s, csets in zip(batch, loaded):
+                if isinstance(csets, Exception) or not csets:
+                    continue
+                try:
+                    # First pass without 2M.
+                    a = analyze(s, csets)
+                    if a:
+                        results.append((s, a, csets))
+                except Exception as e:
+                    log.exception("Analyze %s failed: %s", s, e)
 
-async def post_shutdown(app):
-    global scan_task, tracker_task
+        # Only top candidates get the 2M trigger fetch. This keeps the API load sane.
+        candidates = sorted(
+            [x for x in results if x[1].status in ("READY", "WATCH")],
+            key=lambda x: x[1].score,
+            reverse=True
+        )[:12]
 
-    for task in (scan_task, tracker_task):
-        if task:
-            task.cancel()
+        final = []
+        for s, a, csets in candidates:
             try:
-                await task
-            except asyncio.CancelledError:
-                pass
+                one = await self.bn.klines(s, "1m", TF_LIMITS["1m"])
+                csets["2m"] = aggregate_2m(one)
+                a2 = analyze(s, csets)
+                if a2:
+                    final.append(a2)
+            except Exception as e:
+                log.exception("2M %s failed: %s", s, e)
 
+        # Send only READY. WATCH remains visible in diagnostics/logs.
+        ready = [a for a in final if a.status == "READY"]
+        ready.sort(key=lambda x: x.score, reverse=True)
+
+        for a in ready[:3]:
+            now = time.time()
+            # Avoid repeating the same pair too often.
+            if now - self.last_sent.get(a.symbol, 0) < 60 * 60:
+                continue
+            self.last_sent[a.symbol] = now
+            try:
+                save_signal(a)
+                await send_signal(self.app.bot, a)
+                log.info("SIGNAL %s %s %s", a.symbol, a.direction, a.score)
+            except Exception as e:
+                log.exception("Send signal failed: %s", e)
+
+        top = sorted(final, key=lambda x: x.score, reverse=True)[:5]
+        log.info(
+            "SCAN complete | universe=%d | candidates=%d | ready=%d | top=%s",
+            len(symbols), len(final), len(ready),
+            [(x.symbol, x.direction, x.score, x.status) for x in top]
+        )
+
+    async def loop(self):
+        await self.bn.start()
+        while True:
+            try:
+                await self.scan_once()
+            except Exception:
+                log.exception("Scanner loop error")
+            await asyncio.sleep(SCAN_SECONDS)
+
+# ---------------- MAIN ----------------
+
+async def post_init(app: Application):
+    bn = Binance()
+    scanner = Scanner(bn, app)
+    app.bot_data["scanner"] = scanner
+    asyncio.create_task(scanner.loop())
+
+async def post_shutdown(app: Application):
+    scanner = app.bot_data.get("scanner")
+    if scanner:
+        await scanner.bn.close()
 
 def main():
-    if not TOKEN:
+    if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is required")
-
+    db()
     app = (
         Application.builder()
-        .token(TOKEN)
+        .token(BOT_TOKEN)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
     )
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("diagnostics", diagnostics))
-    app.add_handler(CommandHandler("performance", performance))
-    app.add_handler(CommandHandler("test", test))
-
-    log.info(
-        "ATLAS AI V8 starting. Signal channel=%s",
-        SIGNAL_CHAT_ID or "NOT SET"
-    )
+    app.add_handler(CommandHandler("test", cmd_test))
+    app.add_handler(CommandHandler("diagnostics", cmd_diagnostics))
+    app.add_handler(CommandHandler("performance", cmd_performance))
+    log.info("ATLAS AI V9 starting...")
     app.run_polling(drop_pending_updates=True)
-
 
 if __name__ == "__main__":
     main()
