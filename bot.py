@@ -378,7 +378,7 @@ class Binance:
 
         return None
 
-    async def symbols(self, limit=80):
+    async def symbols(self, limit=500):
         data = await self.get_json("/api/v3/ticker/24hr")
         if not isinstance(data, list):
             return []
@@ -420,6 +420,11 @@ class Binance:
             for x in (data or [])
         ]
 
+
+# 500-pair universe: meme coins are intentionally NOT excluded.
+# Ranking is by Binance 24h USDT quote volume so the scanner can include
+# liquid meme coins alongside majors and other spot assets.
+MEME_SCAN_ENABLED = True
 
 # ---------------- V9 DECISION ENGINE ----------------
 
