@@ -32,7 +32,8 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Tuple
 
-import aiohttp
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -343,48 +344,53 @@ def aggregate_2m(one_minute: List[Candle]) -> List[Candle]:
 # ---------------- BINANCE ----------------
 
 class Binance:
+    """Binance REST client using Python standard library only."""
+
     def __init__(self):
-        self.session: Optional[aiohttp.ClientSession] = None
         self.sem = asyncio.Semaphore(8)
 
     async def start(self):
-        self.session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=20),
-            headers={"User-Agent": "ATLAS-AI-V9/1.0"}
-        )
+        pass
 
     async def close(self):
-        if self.session:
-            await self.session.close()
+        pass
 
     async def get_json(self, path, params=None):
-        assert self.session
-        url = BINANCE_BASE + path
+        query = urlencode(params or {})
+        url = BINANCE_BASE + path + (("?" + query) if query else "")
+
         async with self.sem:
             for attempt in range(3):
                 try:
-                    async with self.session.get(url, params=params) as r:
-                        if r.status == 429:
-                            await asyncio.sleep(2 + attempt * 2)
-                            continue
-                        r.raise_for_status()
-                        return await r.json()
+                    def fetch():
+                        req = Request(
+                            url,
+                            headers={"User-Agent": "ATLAS-AI-V9/1.0"}
+                        )
+                        with urlopen(req, timeout=20) as response:
+                            return json.loads(response.read().decode("utf-8"))
+
+                    return await asyncio.to_thread(fetch)
                 except Exception:
                     if attempt == 2:
                         raise
                     await asyncio.sleep(1 + attempt)
+
         return None
 
     async def symbols(self, limit=80):
         data = await self.get_json("/api/v3/ticker/24hr")
         if not isinstance(data, list):
             return []
+
         candidates = []
         for x in data:
             s = x.get("symbol", "")
             if not s.endswith("USDT"):
                 continue
-            if any(s.endswith(z) for z in ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")):
+            if any(s.endswith(z) for z in (
+                "UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT"
+            )):
                 continue
             try:
                 qv = float(x.get("quoteVolume", 0))
@@ -393,6 +399,7 @@ class Binance:
                     candidates.append((qv, s))
             except Exception:
                 pass
+
         candidates.sort(reverse=True)
         return [s for _, s in candidates[:limit]]
 
@@ -401,17 +408,18 @@ class Binance:
             "/api/v3/klines",
             {"symbol": symbol, "interval": interval, "limit": limit}
         )
-        out = []
-        for x in data or []:
-            out.append(Candle(
+        return [
+            Candle(
                 ts=int(x[0]),
                 o=float(x[1]),
                 h=float(x[2]),
                 l=float(x[3]),
                 c=float(x[4]),
                 v=float(x[5]),
-            ))
-        return out
+            )
+            for x in (data or [])
+        ]
+
 
 # ---------------- V9 DECISION ENGINE ----------------
 
