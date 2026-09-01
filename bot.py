@@ -1,8 +1,8 @@
 """
-ATLAS AI V9.2
+ATLAS AI V9.7
 Paper-signal / research bot for Binance spot markets.
 
-V9.2 change:
+V9.7 change:
 - /test now sends a real test notification to SIGNAL_CHAT.
 - Existing scanner/signal architecture is preserved.
 - No order execution.
@@ -40,11 +40,23 @@ UNIVERSE_SIZE = int(os.getenv("UNIVERSE_SIZE", "500"))
 DETAILED_UNIVERSE = int(os.getenv("DETAILED_UNIVERSE", "120"))
 ENTRY_CANDIDATES = int(os.getenv("ENTRY_CANDIDATES", "20"))
 
+LEVEL_ALERT_PCT = float(os.getenv("LEVEL_ALERT_PCT", "0.75"))
+LEVEL_ALERT_COOLDOWN = int(os.getenv("LEVEL_ALERT_COOLDOWN", "1800"))
+RADAR_INTERVAL = int(os.getenv("RADAR_INTERVAL", "1800"))
+RADAR_TOP_N = int(os.getenv("RADAR_TOP_N", "8"))
+
 READY_SCORE = int(os.getenv("READY_SCORE", "80"))
 WATCH_SCORE = int(os.getenv("WATCH_SCORE", "72"))
 MIN_RR = float(os.getenv("MIN_RR", "2.5"))
-MIN_TP2_PCT = float(os.getenv("MIN_TP2_PCT", "2.5"))
+MIN_TP_PCT = float(os.getenv("MIN_TP_PCT", "2.5"))
 MAX_STOP_PCT = float(os.getenv("MAX_STOP_PCT", "3.5"))
+
+# V9.7 WATCH quality filters:
+# WATCH is a monitoring alert, but it must still have a usable risk profile.
+WATCH_MIN_RR = float(os.getenv("WATCH_MIN_RR", "1.5"))
+WATCH_MAX_STOP_PCT = float(
+    os.getenv("WATCH_MAX_STOP_PCT", "3.5")
+)
 
 TF_LIMITS = {
     "1d": 160,
@@ -60,7 +72,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-log = logging.getLogger("ATLAS-V9.2")
+log = logging.getLogger("ATLAS-V9.7")
 
 
 # ---------------- DATA ----------------
@@ -84,8 +96,7 @@ class Analysis:
     reason: str
     entry: float
     stop: float
-    tp1: float
-    tp2: float
+    tp: float
     rr: float
     support: float
     resistance: float
@@ -140,8 +151,8 @@ def save_signal(a: Analysis):
         a.score,
         a.entry,
         a.stop,
-        a.tp1,
-        a.tp2,
+        None,
+        a.tp,
         "OPEN",
     ))
     conn.commit()
@@ -152,13 +163,10 @@ def performance():
     conn = db()
     total = conn.execute(
         "SELECT COUNT(*) FROM signals "
-        "WHERE status IN ('TP1','TP2','STOP','EXPIRED')"
+        "WHERE status IN ('TP1','TP','STOP','EXPIRED')"
     ).fetchone()[0]
-    tp2 = conn.execute(
-        "SELECT COUNT(*) FROM signals WHERE status='TP2'"
-    ).fetchone()[0]
-    tp1 = conn.execute(
-        "SELECT COUNT(*) FROM signals WHERE status='TP1'"
+    tp = conn.execute(
+        "SELECT COUNT(*) FROM signals WHERE status IN ('TP', 'TP', 'TP1')"
     ).fetchone()[0]
     stop = conn.execute(
         "SELECT COUNT(*) FROM signals WHERE status='STOP'"
@@ -171,9 +179,9 @@ def performance():
     ).fetchone()[0]
     conn.close()
 
-    wins = tp1 + tp2
+    wins = tp
     wr = (wins / total * 100) if total else 0.0
-    return total, tp2, tp1, stop, expired, opened, wr
+    return total, tp, stop, expired, opened, wr
 
 
 # ---------------- INDICATORS ----------------
@@ -481,7 +489,7 @@ class Binance:
                         req = Request(
                             url,
                             headers={
-                                "User-Agent": "ATLAS-AI-V9.2/1.0"
+                                "User-Agent": "ATLAS-AI-V9.7/1.0"
                             }
                         )
                         with urlopen(req, timeout=20) as response:
@@ -733,17 +741,27 @@ def analyze(
             )
             risk = price - stop
 
-            tp1 = price + max(
-                1.6 * risk,
-                0.012 * price
+            # Dynamic TP: market structure first.
+            # The 2.5% rule is only a minimum distance gate.
+            structural_tp = (
+                resistance * 0.997
+                if resistance > price
+                else 0.0
             )
-            tp2 = price + max(
-                2.5 * risk,
-                0.025 * price
-            )
+            minimum_tp = price * (1.0 + MIN_TP_PCT / 100.0)
+            rr_floor_tp = price + MIN_RR * risk
 
-            if resistance > price and resistance < tp2:
-                tp2 = resistance * 0.997
+            if structural_tp > 0:
+                tp = max(
+                    structural_tp,
+                    minimum_tp,
+                    rr_floor_tp
+                )
+            else:
+                tp = max(
+                    minimum_tp,
+                    rr_floor_tp
+                )
 
         else:
             structural_stop = max(
@@ -756,24 +774,32 @@ def analyze(
             )
             risk = stop - price
 
-            tp1 = price - max(
-                1.6 * risk,
-                0.012 * price
+            structural_tp = (
+                support * 1.003
+                if support < price
+                else 0.0
             )
-            tp2 = price - max(
-                2.5 * risk,
-                0.025 * price
-            )
+            minimum_tp = price * (1.0 - MIN_TP_PCT / 100.0)
+            rr_floor_tp = price - MIN_RR * risk
 
-            if support < price and support > tp2:
-                tp2 = support * 1.003
+            if structural_tp > 0:
+                tp = min(
+                    structural_tp,
+                    minimum_tp,
+                    rr_floor_tp
+                )
+            else:
+                tp = min(
+                    minimum_tp,
+                    rr_floor_tp
+                )
 
         if risk <= 0:
             return None
 
-        rr = abs(tp2 - price) / risk
+        rr = abs(tp - price) / risk
         stop_pct = risk / price * 100
-        tp2_pct = abs(tp2 - price) / price * 100
+        tp_pct = abs(tp - price) / price * 100
 
         if stop_pct > MAX_STOP_PCT:
             score -= 8
@@ -786,12 +812,12 @@ def analyze(
             score -= 10
             reasons.append("RR weak")
 
-        if tp2_pct >= MIN_TP2_PCT:
+        if tp_pct >= MIN_TP_PCT:
             score += 5
-            reasons.append(f"TP2 {tp2_pct:.1f}%")
+            reasons.append(f"TP {tp_pct:.1f}%")
         else:
             score -= 10
-            reasons.append("TP2 too close")
+            reasons.append("TP too close")
 
         contradiction = (
             (direction == "LONG" and d1 == "BEARISH")
@@ -805,14 +831,27 @@ def analyze(
 
         score = max(0, min(100, int(score)))
 
+        # V9.7: WATCH is allowed below READY, but never with
+        # an obviously bad risk profile.
+        watch_quality_ok = (
+            rr >= WATCH_MIN_RR
+            and stop_pct <= WATCH_MAX_STOP_PCT
+            and tp_pct >= MIN_TP_PCT
+        )
+
         if (
             score >= READY_SCORE
             and not contradiction
             and rr >= MIN_RR
-            and tp2_pct >= MIN_TP2_PCT
+            and stop_pct <= MAX_STOP_PCT
+            and tp_pct >= MIN_TP_PCT
         ):
             status = "READY"
-        elif score >= WATCH_SCORE:
+        elif (
+            score >= WATCH_SCORE
+            and not contradiction
+            and watch_quality_ok
+        ):
             status = "WATCH"
         else:
             status = "IGNORE"
@@ -825,8 +864,7 @@ def analyze(
             reason=", ".join(reasons[:8]) or "Confluence incomplete",
             entry=price,
             stop=stop,
-            tp1=tp1,
-            tp2=tp2,
+            tp=tp,
             rr=rr,
             support=support,
             resistance=resistance,
@@ -873,13 +911,13 @@ def signal_text(a: Analysis):
     side = "LONG / AL" if a.direction == "LONG" else "SHORT / SAT"
 
     return (
-        "🎯 ATLAS AI V9.3 SIGNAL\n\n"
+        "🎯 ATLAS AI V9.7 SIGNAL\n\n"
         f"{a.symbol} — {icon} {side}\n"
         f"Skor: {a.score}/100\n\n"
         f"Entry: {fmt_price(a.entry)}\n"
         f"Stop: {fmt_price(a.stop)}\n"
         f"TP1: {fmt_price(a.tp1)}\n"
-        f"TP2: {fmt_price(a.tp2)}\n\n"
+        f"TP: {fmt_price(a.tp2)}\n\n"
         f"🟢 Destek: {fmt_price(a.support)}\n"
         f"🔴 Direnç: {fmt_price(a.resistance)}\n"
         f"POC: {fmt_price(a.poc)} | "
@@ -902,20 +940,23 @@ def watch_text(a: Analysis):
     side = "LONG / AL" if a.direction == "LONG" else "SHORT / SAT"
 
     return (
-        "👀 ATLAS AI V9.3 WATCH\n\n"
+        "👀 ATLAS AI V9.7 WATCH\n\n"
         f"{a.symbol} — {icon} {side}\n"
         f"Skor: {a.score}/100\n"
         f"Entry: {fmt_price(a.entry)}\n"
         f"Stop: {fmt_price(a.stop)}\n"
-        f"TP2: {fmt_price(a.tp2)}\n"
+        f"TP: {fmt_price(a.tp)}\n"
         f"RR: 1:{a.rr:.1f}\n"
-        f"TP2 mesafesi: {abs(a.tp2 - a.entry) / a.entry * 100:.1f}%\n\n"
+        f"TP mesafesi: {abs(a.tp2 - a.entry) / a.entry * 100:.1f}%\n\n"
         f"MTF: {a.htf}\n"
         f"15M trigger: {a.trigger_15m}\n"
         f"2M: {a.trigger_2m}\n\n"
         f"📌 Neden WATCH: {a.reason}\n"
         "⏳ READY eşiği: "
         f"{READY_SCORE}/100\n"
+        f"🛡️ WATCH filtresi: RR ≥ 1:{WATCH_MIN_RR:.1f}, "
+        f"Stop ≤ {WATCH_MAX_STOP_PCT:.1f}%, "
+        f"TP ≥ {MIN_TP_PCT:.1f}%\n"
         "⚠️ Henüz işlem sinyali değildir; takip listesidir."
     )
 
@@ -952,7 +993,7 @@ async def send_signal(bot, a: Analysis):
 
 async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    V9.2:
+    V9.7:
     /test komutu gerçek SIGNAL_CHAT kanalına test bildirimi yollar.
     """
 
@@ -960,7 +1001,7 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     test_time = now.strftime("%d.%m.%Y %H:%M:%S")
 
     test_text = (
-        "🧪 ATLAS AI V9.2 TEST OK\n\n"
+        "🧪 ATLAS AI V9.7 TEST OK\n\n"
         "✅ Bot aktif\n"
         "✅ Telegram bağlantısı çalışıyor\n"
         "✅ Komut sistemi çalışıyor\n"
@@ -1002,13 +1043,12 @@ async def cmd_performance(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-    total, tp2, tp1, stop, expired, opened, wr = performance()
+    total, tp, stop, expired, opened, wr = performance()
 
     await update.message.reply_text(
-        "📊 ATLAS AI V9.3 PERFORMANCE\n\n"
+        "📊 ATLAS AI V9.7 PERFORMANCE\n\n"
         f"Sonuçlanan: {total}\n"
-        f"TP2: {tp2}\n"
-        f"TP1: {tp1}\n"
+        f"TP: {tp}\n"
         f"STOP: {stop}\n"
         f"EXPIRED: {expired}\n"
         f"Açık: {opened}\n"
@@ -1022,17 +1062,109 @@ async def cmd_diagnostics(
     context: ContextTypes.DEFAULT_TYPE
 ):
     await update.message.reply_text(
-        "🛠️ ATLAS AI V9.3 DIAGNOSTICS\n\n"
+        "🛠️ ATLAS AI V9.7 DIAGNOSTICS\n\n"
         f"Universe: {UNIVERSE_SIZE} USDT pairs\n"
         "Decision TF: 1D / 4H / 1H / 15M\n"
         "2M: entry / anti-miss only\n"
         f"Ready threshold: {READY_SCORE}\n"
         f"Watch threshold: {WATCH_SCORE}\n"
         "Watch alerts: top 3 + score improvement >= 3\n"
+        f"Level alert: <= %{LEVEL_ALERT_PCT:.2f}\n"
+        f"Market radar: every {RADAR_INTERVAL // 60} min / top {RADAR_TOP_N}\n"
+        f"Watch risk filter: RR >= 1:{WATCH_MIN_RR:.1f}, "
+        f"Stop <= {WATCH_MAX_STOP_PCT:.1f}%, "
+        f"TP >= {MIN_TP_PCT:.1f}%\n"
         f"Min RR: 1:{MIN_RR}\n"
-        f"Min TP2: {MIN_TP2_PCT}%\n"
+        f"Min TP: {MIN_TP_PCT}%\n"
         f"Signal chat: {SIGNAL_CHAT}\n"
         "Execution: OFF (paper only)"
+    )
+
+
+# ---------------- V9.7 MARKET RADAR ----------------
+
+def level_alert(a: Analysis):
+    if a.entry <= 0:
+        return None
+
+    support_pct = (
+        (a.entry - a.support) / a.entry * 100
+        if a.support < a.entry else 999.0
+    )
+    resistance_pct = (
+        (a.resistance - a.entry) / a.entry * 100
+        if a.resistance > a.entry else 999.0
+    )
+
+    candidates = []
+    if support_pct <= LEVEL_ALERT_PCT:
+        candidates.append(("SUPPORT", support_pct, a.support))
+    if resistance_pct <= LEVEL_ALERT_PCT:
+        candidates.append(("RESISTANCE", resistance_pct, a.resistance))
+
+    return min(candidates, key=lambda x: x[1]) if candidates else None
+
+
+def radar_score(a: Analysis):
+    alert = level_alert(a)
+    proximity = 0.0
+    if alert:
+        proximity = max(0.0, LEVEL_ALERT_PCT - alert[1]) * 20.0
+    return a.score + proximity + min(abs(a.rr), 5.0) * 2.0
+
+
+def radar_text(items):
+    now = datetime.now(timezone.utc).astimezone()
+    lines = [
+        "📊 ATLAS AI V9.7 MARKET RADAR",
+        "",
+        f"🕐 {now.strftime('%d.%m.%Y %H:%M:%S')}",
+        f"🌐 Tarama: {UNIVERSE_SIZE} USDT",
+        "",
+    ]
+
+    for a in items:
+        icon = "🟢" if a.direction == "LONG" else "🔴"
+        alert = level_alert(a)
+
+        if alert:
+            kind, pct, level = alert
+            label = "DESTEK" if kind == "SUPPORT" else "DİRENÇ"
+            level_text = f"📍 {label} %{pct:.2f} yakın ({fmt_price(level)})"
+        else:
+            level_text = "Seviye yakın değil"
+
+        lines.append(
+            f"{icon} {a.symbol} | {a.direction} | "
+            f"Skor {a.score} | RR 1:{a.rr:.1f}"
+        )
+        lines.append(f"   {level_text}")
+
+    lines.extend([
+        "",
+        f"🎯 Level alert: ≤ %{LEVEL_ALERT_PCT:.2f}",
+        "👀 WATCH: kalite filtresinden geçen adaylar",
+        "🚨 READY: gerçek paper sinyali",
+    ])
+    return "\n".join(lines)
+
+
+async def send_radar(bot, items):
+    if not items:
+        return
+
+    keyboard = [
+        [InlineKeyboardButton(
+            f"📈 {a.symbol}",
+            url=a.tv_url
+        )]
+        for a in items[:3]
+    ]
+
+    await bot.send_message(
+        chat_id=SIGNAL_CHAT,
+        text=radar_text(items),
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 
@@ -1043,7 +1175,9 @@ class Scanner:
         self.bn = bn
         self.app = app
         self.last_sent = {}
-        # V9.3: remember the last WATCH score so we only notify
+        self.last_level_alert = {}
+        self.last_radar = 0.0
+        # V9.7: remember the last WATCH score so we only notify
         # when a candidate becomes meaningfully stronger.
         self.last_watch_score = {}
 
@@ -1238,6 +1372,65 @@ class Scanner:
                     s
                 )
 
+        # V9.7: important support/resistance proximity alerts.
+        for a in final:
+            alert = level_alert(a)
+            if not alert:
+                continue
+
+            kind, pct, level = alert
+            key = f"{a.symbol}:{kind}"
+            if time.time() - self.last_level_alert.get(key, 0) < LEVEL_ALERT_COOLDOWN:
+                continue
+
+            label = (
+                "🔵 DESTEĞE YAKLAŞIYOR"
+                if kind == "SUPPORT"
+                else "🟠 DİRENCE YAKLAŞIYOR"
+            )
+
+            try:
+                await self.app.bot.send_message(
+                    chat_id=SIGNAL_CHAT,
+                    text=(
+                        "🎯 ATLAS AI V9.7 LEVEL ALERT\n\n"
+                        f"{a.symbol} — {a.direction}\n"
+                        f"{label}\n"
+                        f"Mevcut: {fmt_price(a.entry)}\n"
+                        f"Seviye: {fmt_price(level)}\n"
+                        f"Mesafe: %{pct:.2f}\n"
+                        f"Skor: {a.score}/100\n"
+                        f"MTF: {a.htf}\n\n"
+                        "👀 Olası reaksiyon bölgesi. "
+                        "Tek başına işlem sinyali değildir."
+                    ),
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton(
+                            "📈 TradingView'de Aç",
+                            url=a.tv_url
+                        )
+                    ]])
+                )
+                self.last_level_alert[key] = time.time()
+            except Exception:
+                log.exception("Level alert failed: %s", a.symbol)
+
+        # V9.7: consolidated market radar every 30 minutes.
+        now = time.time()
+        if now - self.last_radar >= RADAR_INTERVAL:
+            radar_items = sorted(
+                final,
+                key=radar_score,
+                reverse=True
+            )[:RADAR_TOP_N]
+
+            try:
+                await send_radar(self.app.bot, radar_items)
+                self.last_radar = now
+                log.info("MARKET RADAR sent | items=%d", len(radar_items))
+            except Exception:
+                log.exception("Market radar send failed")
+
         ready = [
             a for a in final
             if a.status == "READY"
@@ -1257,7 +1450,7 @@ class Scanner:
             reverse=True
         )
 
-        # V9.3 WATCH:
+        # V9.7 WATCH:
         # Notify only the strongest candidates and only when their score
         # improves by at least 3 points. This prevents channel spam.
         for a in watch[:3]:
@@ -1416,7 +1609,7 @@ def main():
     )
 
     log.info(
-        "ATLAS AI V9.3 starting..."
+        "ATLAS AI V9.7 starting..."
     )
 
     app.run_polling(
