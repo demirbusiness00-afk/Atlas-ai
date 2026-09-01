@@ -873,7 +873,7 @@ def signal_text(a: Analysis):
     side = "LONG / AL" if a.direction == "LONG" else "SHORT / SAT"
 
     return (
-        "🎯 ATLAS AI V9.2 SIGNAL\n\n"
+        "🎯 ATLAS AI V9.3 SIGNAL\n\n"
         f"{a.symbol} — {icon} {side}\n"
         f"Skor: {a.score}/100\n\n"
         f"Entry: {fmt_price(a.entry)}\n"
@@ -894,6 +894,44 @@ def signal_text(a: Analysis):
         f"RR: 1:{a.rr:.1f}\n"
         f"Neden: {a.reason}\n\n"
         "⚠️ Araştırma/paper sinyali. Kâr garantisi yoktur."
+    )
+
+
+def watch_text(a: Analysis):
+    icon = "🟢" if a.direction == "LONG" else "🔴"
+    side = "LONG / AL" if a.direction == "LONG" else "SHORT / SAT"
+
+    return (
+        "👀 ATLAS AI V9.3 WATCH\n\n"
+        f"{a.symbol} — {icon} {side}\n"
+        f"Skor: {a.score}/100\n"
+        f"Entry: {fmt_price(a.entry)}\n"
+        f"Stop: {fmt_price(a.stop)}\n"
+        f"TP2: {fmt_price(a.tp2)}\n"
+        f"RR: 1:{a.rr:.1f}\n"
+        f"TP2 mesafesi: {abs(a.tp2 - a.entry) / a.entry * 100:.1f}%\n\n"
+        f"MTF: {a.htf}\n"
+        f"15M trigger: {a.trigger_15m}\n"
+        f"2M: {a.trigger_2m}\n\n"
+        f"📌 Neden WATCH: {a.reason}\n"
+        "⏳ READY eşiği: "
+        f"{READY_SCORE}/100\n"
+        "⚠️ Henüz işlem sinyali değildir; takip listesidir."
+    )
+
+
+async def send_watch(bot, a: Analysis):
+    keyboard = [[
+        InlineKeyboardButton(
+            "📈 TradingView'de Aç",
+            url=a.tv_url
+        )
+    ]]
+
+    await bot.send_message(
+        chat_id=SIGNAL_CHAT,
+        text=watch_text(a),
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 
@@ -967,7 +1005,7 @@ async def cmd_performance(
     total, tp2, tp1, stop, expired, opened, wr = performance()
 
     await update.message.reply_text(
-        "📊 ATLAS AI V9.2 PERFORMANCE\n\n"
+        "📊 ATLAS AI V9.3 PERFORMANCE\n\n"
         f"Sonuçlanan: {total}\n"
         f"TP2: {tp2}\n"
         f"TP1: {tp1}\n"
@@ -984,12 +1022,13 @@ async def cmd_diagnostics(
     context: ContextTypes.DEFAULT_TYPE
 ):
     await update.message.reply_text(
-        "🛠️ ATLAS AI V9.2 DIAGNOSTICS\n\n"
+        "🛠️ ATLAS AI V9.3 DIAGNOSTICS\n\n"
         f"Universe: {UNIVERSE_SIZE} USDT pairs\n"
         "Decision TF: 1D / 4H / 1H / 15M\n"
         "2M: entry / anti-miss only\n"
         f"Ready threshold: {READY_SCORE}\n"
         f"Watch threshold: {WATCH_SCORE}\n"
+        "Watch alerts: top 3 + score improvement >= 3\n"
         f"Min RR: 1:{MIN_RR}\n"
         f"Min TP2: {MIN_TP2_PCT}%\n"
         f"Signal chat: {SIGNAL_CHAT}\n"
@@ -1004,6 +1043,9 @@ class Scanner:
         self.bn = bn
         self.app = app
         self.last_sent = {}
+        # V9.3: remember the last WATCH score so we only notify
+        # when a candidate becomes meaningfully stronger.
+        self.last_watch_score = {}
 
     async def load_symbol(self, symbol):
         tasks = [
@@ -1201,11 +1243,50 @@ class Scanner:
             if a.status == "READY"
         ]
 
+        watch = [
+            a for a in final
+            if a.status == "WATCH"
+        ]
+
         ready.sort(
             key=lambda x: x.score,
             reverse=True
         )
+        watch.sort(
+            key=lambda x: x.score,
+            reverse=True
+        )
 
+        # V9.3 WATCH:
+        # Notify only the strongest candidates and only when their score
+        # improves by at least 3 points. This prevents channel spam.
+        for a in watch[:3]:
+            previous = self.last_watch_score.get(a.symbol)
+
+            if previous is not None and a.score < previous + 3:
+                continue
+
+            try:
+                await send_watch(
+                    self.app.bot,
+                    a
+                )
+                self.last_watch_score[a.symbol] = a.score
+
+                log.info(
+                    "WATCH %s %s %s",
+                    a.symbol,
+                    a.direction,
+                    a.score
+                )
+
+            except Exception:
+                log.exception(
+                    "Send watch failed: %s",
+                    a.symbol
+                )
+
+        # READY remains the real signal and is rate-limited per symbol.
         for a in ready[:3]:
             now = time.time()
 
@@ -1335,7 +1416,7 @@ def main():
     )
 
     log.info(
-        "ATLAS AI V9.2 starting..."
+        "ATLAS AI V9.3 starting..."
     )
 
     app.run_polling(
