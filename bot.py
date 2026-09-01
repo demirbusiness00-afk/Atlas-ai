@@ -1,5 +1,5 @@
 """
-ATLAS AI V9
+ATLAS AI V9.1
 Paper-signal / research bot for Binance spot markets.
 
 Architecture:
@@ -48,7 +48,12 @@ SIGNAL_CHAT = os.getenv("SIGNAL_CHAT", os.getenv("SIGNAL_CHANNEL", "@ATLASRADAR"
 
 BINANCE_BASE = os.getenv("BINANCE_BASE", "https://api.binance.com").rstrip("/")
 SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "120"))
-UNIVERSE_SIZE = int(os.getenv("UNIVERSE_SIZE", "80"))
+UNIVERSE_SIZE = int(os.getenv("UNIVERSE_SIZE", "500"))
+# V9.1 staged scan:
+# 500 pairs are screened on 15m first, then only the strongest candidates
+# receive the expensive 1D/4H/1H confirmation and 1m/2m entry check.
+DETAILED_UNIVERSE = int(os.getenv("DETAILED_UNIVERSE", "120"))
+ENTRY_CANDIDATES = int(os.getenv("ENTRY_CANDIDATES", "20"))
 
 # Keep signal quality high, but don't make V8's "everything must agree" mistake.
 READY_SCORE = int(os.getenv("READY_SCORE", "80"))
@@ -66,7 +71,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-log = logging.getLogger("ATLAS-V9")
+log = logging.getLogger("ATLAS-V9.1")
 
 # ---------------- DATA ----------------
 
@@ -365,7 +370,7 @@ class Binance:
                     def fetch():
                         req = Request(
                             url,
-                            headers={"User-Agent": "ATLAS-AI-V9/1.0"}
+                            headers={"User-Agent": "ATLAS-AI-V9.1/1.0"}
                         )
                         with urlopen(req, timeout=20) as response:
                             return json.loads(response.read().decode("utf-8"))
@@ -424,7 +429,7 @@ class Binance:
 # 500-pair universe: meme coins are intentionally NOT excluded.
 # Ranking is by Binance 24h USDT quote volume so the scanner can include
 # liquid meme coins alongside majors and other spot assets.
-MEME_SCAN_ENABLED = True
+MEME_SCAN_ENABLED = True  # Meme coins are eligible; liquidity/volume still matters.
 
 # ---------------- V9 DECISION ENGINE ----------------
 
@@ -622,7 +627,7 @@ def signal_text(a: Analysis):
     icon = "🟢" if a.direction == "LONG" else "🔴"
     side = "LONG / AL" if a.direction == "LONG" else "SHORT / SAT"
     return (
-        f"🎯 ATLAS AI V9 SIGNAL\n\n"
+        f"🎯 ATLAS AI V9.1 SIGNAL\n\n"
         f"{a.symbol} — {icon} {side}\n"
         f"Skor: {a.score}/100\n\n"
         f"Entry: {fmt_price(a.entry)}\n"
@@ -653,7 +658,7 @@ async def send_signal(bot, a: Analysis):
 
 async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🧪 ATLAS AI V9 TEST OK\n"
+        "🧪 ATLAS AI V9.1 TEST OK\n"
         "Binance REST: hazır\n"
         f"Signal chat: {SIGNAL_CHAT}\n"
         "Timeframes: 1D → 4H → 1H → 15M | 2M anti-miss\n"
@@ -663,7 +668,7 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_performance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total, tp2, tp1, stop, expired, opened, wr = performance()
     await update.message.reply_text(
-        "📊 ATLAS AI V9 PERFORMANCE\n\n"
+        "📊 ATLAS AI V9.1 PERFORMANCE\n\n"
         f"Sonuçlanan: {total}\n"
         f"TP2: {tp2}\n"
         f"TP1: {tp1}\n"
@@ -676,7 +681,7 @@ async def cmd_performance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_diagnostics(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🛠️ ATLAS AI V9 DIAGNOSTICS\n\n"
+        "🛠️ ATLAS AI V9.1 DIAGNOSTICS\n\n"
         f"Universe: {UNIVERSE_SIZE} USDT pairs\n"
         "Decision TF: 1D / 4H / 1H / 15M\n"
         "2M: entry / anti-miss only\n"
@@ -710,15 +715,65 @@ class Scanner:
         # Only fetch 1m for candidates after initial analysis.
         return {"1d": d, "4h": h4, "1h": h1, "15m": m15}
 
+    @staticmethod
+    def quick_screen_score(candles):
+        """Fast 15m pre-filter used across the 500-pair universe."""
+        if not candles or len(candles) < 50:
+            return -1.0
+
+        recent = candles[-1]
+        prev = candles[-17]
+        price = recent.c
+
+        if price <= 0:
+            return -1.0
+
+        change = (price / prev.c - 1.0) * 100.0
+
+        vols = [x.v for x in candles[-30:-1]]
+        avg_vol = sum(vols) / max(len(vols), 1)
+        vol_ratio = recent.v / avg_vol if avg_vol > 0 else 0.0
+
+        # Prefer meaningful movement + participation, but do not require
+        # a bullish direction; shorts must survive the same pre-filter.
+        movement = min(abs(change), 12.0) * 4.0
+        participation = min(vol_ratio, 4.0) * 8.0
+
+        return movement + participation
+
     async def scan_once(self):
         symbols = await self.bn.symbols(UNIVERSE_SIZE)
         if not symbols:
             log.warning("No symbols received.")
             return
 
+        # Stage 1: screen all 500 pairs cheaply on 15m.
+        # This keeps the scan broad without making 500 x 4 timeframe API
+        # requests every cycle.
+        screened = []
+        for i in range(0, len(symbols), 16):
+            batch = symbols[i:i+16]
+            loaded_15m = await asyncio.gather(
+                *(self.bn.klines(s, "15m", 120) for s in batch),
+                return_exceptions=True
+            )
+            for s, candles in zip(batch, loaded_15m):
+                if isinstance(candles, Exception) or not candles:
+                    continue
+                try:
+                    score = self.quick_screen_score(candles)
+                    if score >= 0:
+                        screened.append((score, s))
+                except Exception as e:
+                    log.exception("Quick screen %s failed: %s", s, e)
+
+        screened.sort(reverse=True)
+        detailed_symbols = [s for _, s in screened[:DETAILED_UNIVERSE]]
+
+        # Stage 2: full 1D -> 4H -> 1H -> 15M decision stack.
         results = []
-        for i in range(0, len(symbols), 8):
-            batch = symbols[i:i+8]
+        for i in range(0, len(detailed_symbols), 8):
+            batch = detailed_symbols[i:i+8]
             loaded = await asyncio.gather(
                 *(self.load_symbol(s) for s in batch),
                 return_exceptions=True
@@ -727,7 +782,6 @@ class Scanner:
                 if isinstance(csets, Exception) or not csets:
                     continue
                 try:
-                    # First pass without 2M.
                     a = analyze(s, csets)
                     if a:
                         results.append((s, a, csets))
@@ -739,7 +793,7 @@ class Scanner:
             [x for x in results if x[1].status in ("READY", "WATCH")],
             key=lambda x: x[1].score,
             reverse=True
-        )[:12]
+        )[:ENTRY_CANDIDATES]
 
         final = []
         for s, a, csets in candidates:
@@ -812,7 +866,7 @@ def main():
     app.add_handler(CommandHandler("test", cmd_test))
     app.add_handler(CommandHandler("diagnostics", cmd_diagnostics))
     app.add_handler(CommandHandler("performance", cmd_performance))
-    log.info("ATLAS AI V9 starting...")
+    log.info("ATLAS AI V9.1 starting...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
